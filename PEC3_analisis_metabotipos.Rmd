@@ -1,0 +1,486 @@
+---
+title: "Análisis multiómico simple usando MFA"
+author: "Análisis de Datos Ómicos (M0.157)"
+date: "`r format(Sys.Date(), '%d/%m/%Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: show
+    df_print: paged
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+params:
+  data_file: "data/multiomics_data.csv"
+  output_dir: "results"
+  fig_dir: "results/figures"
+  data_workbook: "results/PEC3_datos_multiomicos.xlsx"
+  results_workbook: "results/PEC3_resultados_multiomicos.xlsx"
+---
+
+```{r setup}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  fig.width = 7,
+  fig.height = 5
+)
+
+required_pkgs <- c(
+  "FactoMineR", "factoextra", "ggplot2", "dplyr", "tidyr",
+  "tibble", "forcats", "cluster", "openxlsx", "knitr", "kableExtra",
+  "ggrepel", "scales"
+)
+
+missing_pkgs <- required_pkgs[!vapply(required_pkgs, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_pkgs) > 0) {
+  stop(
+    "Faltan paquetes necesarios: ",
+    paste(missing_pkgs, collapse = ", "),
+    ". Instaladlos antes de compilar este documento."
+  )
+}
+
+suppressPackageStartupMessages({
+  library(FactoMineR)
+  library(factoextra)
+  library(ggplot2)
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(forcats)
+  library(cluster)
+  library(openxlsx)
+  library(knitr)
+  library(kableExtra)
+  library(ggrepel)
+  library(scales)
+})
+
+dir.create(params$output_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(params$fig_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+# Presentación
+
+Este documento reproduce un análisis multiómico simplificado, utilizado MFA, que muestra como  identificar de posibles metabotipos asociados al riesgo cardiovascular.
+
+
+# Carga y organización de datos
+
+```{r load-data}
+if (!file.exists(params$data_file)) {
+  stop(
+    "No se encuentra el archivo de datos: ", params$data_file,
+    "\nEste documento asume que las tablas de datos ya han sido generadas previamente."
+  )
+}
+
+dat <- read.csv(params$data_file, check.names = FALSE)
+
+metadata <- dat[, c("sample_id", "risk_group")]
+metadata$risk_group <- factor(metadata$risk_group, levels = c("Low", "High"))
+
+clinical_vars <- c(
+  "BMI", "waist", "glucose", "insulin",
+  "triglycerides", "HDL", "systolic_BP", "CRP"
+)
+
+metabolomics_vars <- grep("^met_", names(dat), value = TRUE)
+microbiome_vars   <- grep("^tax_", names(dat), value = TRUE)
+
+X_mfa <- dat[, c(clinical_vars, metabolomics_vars, microbiome_vars)]
+
+group_sizes <- c(
+  clinical = length(clinical_vars),
+  metabolomics = length(metabolomics_vars),
+  microbiome = length(microbiome_vars)
+)
+
+group_names <- names(group_sizes)
+
+clinical_df <- dat[, c("sample_id", clinical_vars)]
+metabolomics_df <- dat[, c("sample_id", metabolomics_vars)]
+microbiome_df <- dat[, c("sample_id", microbiome_vars)]
+
+variable_block <- tibble(
+  variable = c(clinical_vars, metabolomics_vars, microbiome_vars),
+  block = c(
+    rep("clinical", length(clinical_vars)),
+    rep("metabolomics", length(metabolomics_vars)),
+    rep("microbiome", length(microbiome_vars))
+  )
+)
+
+str(metadata)
+dim(X_mfa)
+group_sizes
+```
+
+# Exportación del libro de datos
+
+```{r export-data-workbook}
+wb_data <- createWorkbook()
+
+addWorksheet(wb_data, "metadata")
+writeDataTable(wb_data, "metadata", metadata)
+
+addWorksheet(wb_data, "clinical")
+writeDataTable(wb_data, "clinical", clinical_df)
+
+addWorksheet(wb_data, "metabolomics")
+writeDataTable(wb_data, "metabolomics", metabolomics_df)
+
+addWorksheet(wb_data, "microbiome")
+writeDataTable(wb_data, "microbiome", microbiome_df)
+
+addWorksheet(wb_data, "multiomics_data")
+writeDataTable(wb_data, "multiomics_data", dat)
+
+saveWorkbook(wb_data, params$data_workbook, overwrite = TRUE)
+```
+
+# Análisis Factorial Múltiple
+
+```{r run-mfa}
+res_mfa <- MFA(
+  X_mfa,
+  group = group_sizes,
+  type = rep("s", length(group_sizes)),
+  name.group = group_names,
+  ncp = 10,
+  graph = FALSE
+)
+
+eig <- as.data.frame(res_mfa$eig) |>
+  rownames_to_column("dimension") |>
+  rename(
+    eigenvalue = eigenvalue,
+    variance_percent = `percentage of variance`,
+    cumulative_variance_percent = `cumulative percentage of variance`
+  )
+
+group_contrib <- as.data.frame(res_mfa$group$contrib) |>
+  rownames_to_column("block")
+
+var_coord <- as.data.frame(res_mfa$quanti.var$coord) |>
+  rownames_to_column("variable") |>
+  left_join(variable_block, by = "variable") |>
+  relocate(block, .after = variable)
+
+var_contrib <- as.data.frame(res_mfa$quanti.var$contrib) |>
+  rownames_to_column("variable") |>
+  left_join(variable_block, by = "variable") |>
+  relocate(block, .after = variable)
+
+var_cos2 <- as.data.frame(res_mfa$quanti.var$cos2) |>
+  rownames_to_column("variable") |>
+  left_join(variable_block, by = "variable") |>
+  relocate(block, .after = variable)
+
+top_dim1 <- var_contrib |>
+  arrange(desc(`Dim.1`)) |>
+  slice_head(n = 15) |>
+  select(variable, block, contribution = `Dim.1`)
+
+top_dim2 <- var_contrib |>
+  arrange(desc(`Dim.2`)) |>
+  slice_head(n = 15) |>
+  select(variable, block, contribution = `Dim.2`)
+
+head(eig)
+group_contrib[, c("block", "Dim.1", "Dim.2")]
+```
+
+## Figuras MFA
+
+```{r mfa-plots}
+p_scree <- fviz_screeplot(
+  res_mfa,
+  addlabels = TRUE,
+  ylim = c(0, 40)
+) +
+  ggtitle("MFA - Varianza explicada")
+
+print(p_scree)
+ggsave(file.path(params$fig_dir, "fig01_mfa_screeplot.png"), p_scree, width = 7, height = 5, dpi = 300)
+
+p_ind_risk <- fviz_mfa_ind(
+  res_mfa,
+  habillage = metadata$risk_group,
+  addEllipses = TRUE,
+  ellipse.type = "confidence",
+  repel = TRUE
+) +
+  ggtitle("MFA - Individuos según riesgo cardiovascular")
+
+print(p_ind_risk)
+ggsave(file.path(params$fig_dir, "fig02_mfa_individuals_risk.png"), p_ind_risk, width = 8, height = 6, dpi = 300)
+
+p_groups <- fviz_mfa_var(res_mfa, "group", repel = TRUE) +
+  ggtitle("MFA - Contribución de los bloques de datos")
+
+print(p_groups)
+ggsave(file.path(params$fig_dir, "fig03_mfa_groups.png"), p_groups, width = 7, height = 6, dpi = 300)
+
+p_vars <- fviz_mfa_var(
+  res_mfa,
+  "quanti.var",
+  habillage = variable_block$block,
+  repel = TRUE
+) +
+  ggtitle("MFA - Variables según bloque")
+
+print(p_vars)
+ggsave(file.path(params$fig_dir, "fig04_mfa_variables_by_block.png"), p_vars, width = 9, height = 7, dpi = 300)
+```
+
+## Variables con mayor contribución
+
+```{r top-contribution-plots}
+plot_top_contrib <- function(top_tbl, title) {
+  ggplot(top_tbl, aes(x = contribution, y = fct_reorder(variable, contribution), fill = block)) +
+    geom_col(show.legend = TRUE) +
+    labs(title = title, x = "Contribución", y = "Variable", fill = "Bloque") +
+    theme_minimal()
+}
+
+p_top_dim1 <- plot_top_contrib(top_dim1, "Top variables - Dimensión 1")
+p_top_dim2 <- plot_top_contrib(top_dim2, "Top variables - Dimensión 2")
+
+print(p_top_dim1)
+print(p_top_dim2)
+
+ggsave(file.path(params$fig_dir, "fig05_top_variables_dim1.png"), p_top_dim1, width = 8, height = 6, dpi = 300)
+ggsave(file.path(params$fig_dir, "fig06_top_variables_dim2.png"), p_top_dim2, width = 8, height = 6, dpi = 300)
+
+top_dim1
+top_dim2
+```
+
+# Clustering sobre componentes MFA
+
+```{r clustering}
+set.seed(42)
+
+M_for_clustering <- 2
+K_opt <- 2
+
+mfa_coords <- as.data.frame(res_mfa$ind$coord[, 1:M_for_clustering, drop = FALSE])
+mfa_coords$sample_id <- metadata$sample_id
+mfa_coords$risk_group <- metadata$risk_group
+
+X_clust <- as.matrix(mfa_coords[, paste0("Dim.", 1:M_for_clustering)])
+D <- dist(X_clust)
+
+sil_tbl <- tibble(
+  k = 2:6,
+  silhouette = sapply(2:6, function(k) {
+    set.seed(42)
+    cl <- pam(D, k = k, do.swap = TRUE)$clustering
+    mean(silhouette(cl, D)[, 3])
+  })
+)
+
+p_sil <- ggplot(sil_tbl, aes(x = k, y = silhouette)) +
+  geom_line() +
+  geom_point(size = 2) +
+  scale_x_continuous(breaks = 2:6) +
+  labs(
+    title = "Evaluación exploratoria del número de clústers",
+    x = "Número de clústers",
+    y = "Silueta media"
+  ) +
+  theme_minimal()
+
+print(p_sil)
+ggsave(file.path(params$fig_dir, "fig07_silhouette_clusters.png"), p_sil, width = 7, height = 5, dpi = 300)
+
+pam_res <- pam(D, k = K_opt, do.swap = TRUE)
+clusters <- factor(pam_res$clustering)
+
+cluster_assignment <- mfa_coords |>
+  mutate(cluster = clusters) |>
+  select(sample_id, risk_group, cluster, starts_with("Dim."))
+
+risk_cluster_table <- table(Cluster = cluster_assignment$cluster, Risk = cluster_assignment$risk_group) |>
+  as.data.frame.matrix() |>
+  rownames_to_column("cluster")
+
+sil_obj <- silhouette(as.integer(clusters), D)
+avg_sil <- mean(sil_obj[, 3])
+
+sil_tbl
+risk_cluster_table
+avg_sil
+```
+
+## Proyección de clústers
+
+```{r cluster-plots}
+plot_df <- cluster_assignment |>
+  mutate(cluster = factor(cluster), risk_group = factor(risk_group, levels = c("Low", "High")))
+
+centers_df <- plot_df |>
+  group_by(cluster) |>
+  summarise(Dim.1 = mean(Dim.1), Dim.2 = mean(Dim.2), .groups = "drop")
+
+p_clusters <- ggplot(plot_df, aes(x = Dim.1, y = Dim.2, color = cluster, shape = risk_group)) +
+  geom_point(size = 2.3, alpha = 0.85) +
+  stat_ellipse(aes(group = cluster, color = cluster), linetype = 2, linewidth = 0.8) +
+  geom_point(data = centers_df, aes(x = Dim.1, y = Dim.2, color = cluster), inherit.aes = FALSE, size = 5, shape = 4, stroke = 1.5) +
+  labs(
+    title = "Clustering sobre componentes MFA",
+    x = paste0("Dim1 (", round(res_mfa$eig[1, 2], 1), "%)"),
+    y = paste0("Dim2 (", round(res_mfa$eig[2, 2], 1), "%)"),
+    color = "Clúster",
+    shape = "Riesgo"
+  ) +
+  theme_minimal()
+
+print(p_clusters)
+ggsave(file.path(params$fig_dir, "fig08_clusters_mfa_space.png"), p_clusters, width = 8, height = 6, dpi = 300)
+```
+
+# Caracterización de clústers
+
+```{r cluster-characterization}
+data_numeric <- dat[, c(clinical_vars, metabolomics_vars, microbiome_vars)]
+
+data_with_cluster <- data.frame(
+  sample_id = metadata$sample_id,
+  risk_group = metadata$risk_group,
+  cluster = clusters,
+  data_numeric,
+  check.names = FALSE
+)
+
+cluster_means <- data_with_cluster |>
+  group_by(cluster) |>
+  summarise(across(all_of(c(clinical_vars, metabolomics_vars, microbiome_vars)), mean), .groups = "drop")
+
+cluster_means_long <- cluster_means |>
+  pivot_longer(-cluster, names_to = "variable", values_to = "cluster_mean") |>
+  left_join(variable_block, by = "variable")
+
+global_means_long <- data_numeric |>
+  summarise(across(everything(), mean)) |>
+  pivot_longer(everything(), names_to = "variable", values_to = "global_mean")
+
+top_cluster_profile <- cluster_means_long |>
+  left_join(global_means_long, by = "variable") |>
+  mutate(
+    deviation_from_global = cluster_mean - global_mean,
+    abs_deviation_from_global = abs(deviation_from_global)
+  ) |>
+  group_by(cluster) |>
+  arrange(desc(abs_deviation_from_global), .by_group = TRUE) |>
+  slice_head(n = 12) |>
+  ungroup()
+
+cluster_diff <- cluster_means |>
+  pivot_longer(-cluster, names_to = "variable", values_to = "mean") |>
+  pivot_wider(names_from = cluster, values_from = mean, names_prefix = "cluster_") |>
+  left_join(variable_block, by = "variable")
+
+cluster_cols <- grep("^cluster_", names(cluster_diff), value = TRUE)
+if (length(cluster_cols) == 2) {
+  cluster_diff <- cluster_diff |>
+    mutate(
+      difference_cluster2_minus_cluster1 = .data[[cluster_cols[2]]] - .data[[cluster_cols[1]]],
+      abs_difference = abs(difference_cluster2_minus_cluster1)
+    ) |>
+    arrange(desc(abs_difference))
+}
+
+top_cluster_diff <- cluster_diff |>
+  slice_head(n = 15)
+
+p_top_cluster_profile <- ggplot(top_cluster_profile, aes(x = deviation_from_global, y = fct_reorder(variable, deviation_from_global), fill = block)) +
+  geom_col(show.legend = TRUE) +
+  facet_wrap(~ cluster, scales = "free_y") +
+  labs(
+    title = "Variables más características de cada clúster",
+    x = "Diferencia respecto a la media global",
+    y = "Variable",
+    fill = "Bloque"
+  ) +
+  theme_minimal()
+
+print(p_top_cluster_profile)
+ggsave(file.path(params$fig_dir, "fig09_cluster_characterization.png"), p_top_cluster_profile, width = 10, height = 6, dpi = 300)
+
+p_top_cluster_diff <- top_cluster_diff |>
+  ggplot(aes(x = difference_cluster2_minus_cluster1, y = fct_reorder(variable, difference_cluster2_minus_cluster1), fill = block)) +
+  geom_col() +
+  labs(
+    title = "Variables que más diferencian los dos clústers",
+    x = "Media clúster 2 - media clúster 1",
+    y = "Variable",
+    fill = "Bloque"
+  ) +
+  theme_minimal()
+
+print(p_top_cluster_diff)
+ggsave(file.path(params$fig_dir, "fig10_cluster_differences.png"), p_top_cluster_diff, width = 9, height = 6, dpi = 300)
+
+top_cluster_profile
+top_cluster_diff
+```
+
+# Exportación del libro de resultados
+
+```{r export-results-workbook}
+wb_results <- createWorkbook()
+
+addWorksheet(wb_results, "eigenvalues")
+writeDataTable(wb_results, "eigenvalues", eig)
+
+addWorksheet(wb_results, "group_contributions")
+writeDataTable(wb_results, "group_contributions", group_contrib)
+
+addWorksheet(wb_results, "variable_contributions")
+writeDataTable(wb_results, "variable_contributions", var_contrib)
+
+addWorksheet(wb_results, "variable_coordinates")
+writeDataTable(wb_results, "variable_coordinates", var_coord)
+
+addWorksheet(wb_results, "variable_cos2")
+writeDataTable(wb_results, "variable_cos2", var_cos2)
+
+addWorksheet(wb_results, "top_dim1")
+writeDataTable(wb_results, "top_dim1", top_dim1)
+
+addWorksheet(wb_results, "top_dim2")
+writeDataTable(wb_results, "top_dim2", top_dim2)
+
+addWorksheet(wb_results, "cluster_assignment")
+writeDataTable(wb_results, "cluster_assignment", cluster_assignment)
+
+addWorksheet(wb_results, "risk_by_cluster")
+writeDataTable(wb_results, "risk_by_cluster", risk_cluster_table)
+
+addWorksheet(wb_results, "cluster_means")
+writeDataTable(wb_results, "cluster_means", cluster_means)
+
+addWorksheet(wb_results, "cluster_profile_top")
+writeDataTable(wb_results, "cluster_profile_top", top_cluster_profile)
+
+addWorksheet(wb_results, "cluster_differences")
+writeDataTable(wb_results, "cluster_differences", cluster_diff)
+
+addWorksheet(wb_results, "silhouette_by_k")
+writeDataTable(wb_results, "silhouette_by_k", sil_tbl)
+
+addWorksheet(wb_results, "silhouette_samples")
+writeDataTable(wb_results, "silhouette_samples", as.data.frame(sil_obj))
+
+saveWorkbook(wb_results, params$results_workbook, overwrite = TRUE)
+```
+
+
